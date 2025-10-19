@@ -21,7 +21,7 @@
     <!-- 홈 화면 -->
     <section id="home" class="rounded-2xl bg-white shadow p-6 hidden">
       <h2 class="text-lg font-semibold mb-2">랜덤 익명 매칭</h2>
-      <p class="text-slate-600 mb-4">아래 중 원하는 방식으로 시작하세요.</p>
+      <p class="text-slate-600 mb-4">원하는 방식으로 시작하세요.</p>
 
       <!-- 자동 매칭 -->
       <div id="idleActions" class="space-y-3">
@@ -33,7 +33,9 @@
       <!-- 매칭중 -->
       <div id="matching" class="hidden flex flex-col items-center justify-center gap-3 py-8">
         <div class="animate-spin w-8 h-8 border-4 border-slate-200 border-t-indigo-600 rounded-full"></div>
-        <p class="text-sm text-slate-700">채팅자 찾는중..</p>
+        <p class="text-sm text-slate-700 text-center">
+          실제 사람이 들어올 때까지 대기 중입니다.<br/>매칭되면 자동으로 채팅방으로 이동해요.
+        </p>
         <button id="btnCancel" class="px-4 py-2 rounded-lg bg-slate-200 text-slate-800 text-sm">취소</button>
       </div>
 
@@ -91,7 +93,7 @@
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
 
   <script>
-    // === 1) Firebase 초기화 ===
+    // === Firebase 초기화 ===
     const firebaseConfig = {
       apiKey: "AIzaSyACfmI0SvAFEEjlFTkkoI1leGoZ-IYj9iI",
       authDomain: "eekmyoung-b85f9.firebaseapp.com",
@@ -104,11 +106,9 @@
     firebase.initializeApp(firebaseConfig);
     const auth = firebase.auth();
     const db = firebase.firestore();
-
-    // === 2) 익명 로그인 ===
     auth.signInAnonymously().catch(console.error);
 
-    // === DOM 요소 ===
+    // === DOM ===
     const authBadge = document.getElementById('authBadge');
     const home = document.getElementById('home');
     const matchingBox = document.getElementById('matching');
@@ -125,7 +125,6 @@
     const form = document.getElementById('messageForm');
     const input = document.getElementById('messageInput');
 
-    // 수동 모드 DOM
     const btnHostManual = document.getElementById('btnHostManual');
     const btnJoinManual = document.getElementById('btnJoinManual');
     const roomCodeInput = document.getElementById('roomCodeInput');
@@ -141,6 +140,14 @@
     let msgUnsub = null;
     let roomRef = null;
 
+    // 매칭 대기열 상태
+    let waitingDocRef = null;
+    let waitingUnsub = null;
+    let waitingHbTimer = null;
+
+    // 룸 하트비트
+    let roomHbTimer = null;
+
     const ADJ = ['푸른','은하','순수','초록','고요','깊은','맑은','번쩍','은빛','따뜻'];
     const ANM = ['여우','수달','돌고래','펭귄','고래','고양이','사자','부엉이','라쿤','두더지'];
     const pickNick = () => `${ADJ[Math.floor(Math.random()*ADJ.length)]} ${ANM[Math.floor(Math.random()*ANM.length)]}`;
@@ -152,6 +159,9 @@
       dbgRoom.textContent = currentRoomId || '-';
       dbgRole.textContent = currentRole || '-';
     };
+    const nowMs = () => Date.now();
+    const roleKey = () => currentRole === 'host' ? 'host' : 'guest';
+    const otherRoleKey = () => currentRole === 'host' ? 'guest' : 'host';
 
     auth.onAuthStateChanged(user => {
       currentUser = user || null;
@@ -163,7 +173,7 @@
       setDebug();
     });
 
-    // ===== 공통 유틸 =====
+    // ========== 유틸 ==========
     function systemMessage(text) {
       const line = document.createElement('div');
       line.className = 'text-center text-xs text-slate-500 my-2';
@@ -182,84 +192,111 @@
       }).catch(()=>{});
     }
 
-    // ===== 자동 매칭 =====
+    // ========== 큐(대기열) 기반 자동 매칭 ==========
     async function startMatching() {
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
-      // 열린 방을 잡아 Guest로 붙는 시도
-      const tryJoinOnce = async () => {
-        const snap = await db.collection('rooms')
-          .where('open','==',true)
-          .limit(5)
-          .get();
+      // 1) 먼저 대기 중인 타 유저가 있으면 트랜잭션으로 매칭
+      const snapshot = await db.collection('waiting')
+        .where('active','==',true)
+        .orderBy('createdAt','asc')
+        .limit(5)
+        .get();
 
-        for (const d of snap.docs) {
-          const ref = d.ref;
-          try {
-            await db.runTransaction(async tx => {
-              const s = await tx.get(ref);
-              if (!s.exists) throw new Error('gone');
-              const room = s.data();
-              if (!room.open) throw new Error('closed');
-              if (room.host === currentUser.uid) throw new Error('self');
+      const others = snapshot.docs.filter(d => d.data().uid !== currentUser.uid);
 
-              const nickG = pickNick();
-              const nickH = room.nicks?.host || pickNick();
-              tx.update(ref, {
-                guest: currentUser.uid,
-                open: false,
-                nicks: { host: nickH, guest: nickG },
-                members: [room.host, currentUser.uid],
-                connected: { host: true, guest: true },
-                ended: false
-              });
+      if (others.length > 0) {
+        const candidate = others[0];
+        try {
+          const roomId = await db.runTransaction(async (tx) => {
+            const candSnap = await tx.get(candidate.ref);
+            if (!candSnap.exists) throw new Error('GONE');
+            const cand = candSnap.data();
+            if (!cand.active || cand.matched) throw new Error('TAKEN');
+
+            const nickA = pickNick(); // host 닉
+            const nickB = pickNick(); // guest 닉
+            const roomRefNew = db.collection('rooms').doc();
+            tx.set(roomRefNew, {
+              open: false,
+              host: cand.uid,
+              guest: currentUser.uid,
+              members: [cand.uid, currentUser.uid],
+              createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+              nicks: { host: nickA, guest: nickB },
+              connected: { host: true, guest: true },
+              hb: { host: nowMs(), guest: nowMs() },
+              ended: false,
+              greeted: false
             });
-            currentRoomId = ref.id;
-            currentRole = 'guest';
-            enterRoomUI();
-            return true;
-          } catch (e) {
-            // 다음 열린 방 시도
-          }
-        }
-        return false;
-      };
 
-      // 경합 대비: 백오프 포함 다회 시도
-      for (let i = 0; i < 5; i++) {
-        const ok = await tryJoinOnce();
-        if (ok) return;
-        await new Promise(r => setTimeout(r, 200 + i * 250));
+            tx.update(candidate.ref, { active:false, matched:true, roomId: roomRefNew.id });
+            const myTicketRef = db.collection('waiting').doc();
+            tx.set(myTicketRef, {
+              uid: currentUser.uid,
+              active:false, matched:true,
+              roomId: roomRefNew.id,
+              createdAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+
+            return roomRefNew.id;
+          });
+
+          currentRoomId = roomId;
+          currentRole = 'guest';
+          enterRoomUI();
+          return;
+        } catch (e) {
+          // 경합 실패 → 내가 줄 서기
+        }
       }
 
-      // 실패 → 내가 host로 대기
-      const nickH = pickNick();
-      const roomDoc = await db.collection('rooms').add({
-        open: true,
-        host: currentUser.uid,
+      // 2) 내가 대기표 생성 (선착)
+      waitingDocRef = await db.collection('waiting').add({
+        uid: currentUser.uid,
+        active: true,
+        matched: false,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        nicks: { host: nickH },
-        members: [currentUser.uid],
-        connected: { host: true, guest: false },
-        ended: false
+        hb: nowMs()
       });
-      currentRoomId = roomDoc.id;
-      currentRole = 'host';
-      setDebug();
 
-      if (roomUnsub) roomUnsub();
-      roomUnsub = roomDoc.onSnapshot(snap => {
-        const d = snap.data();
-        // 게스트가 붙으면 입장
-        if (d?.guest && d.open === false) {
+      // 대기 하트비트
+      waitingHbTimer = setInterval(() => {
+        waitingDocRef.update({ hb: nowMs() }).catch(()=>{});
+      }, 5000);
+
+      // 3) 내 대기표 구독: roomId 세팅되면 host로 입장
+      if (waitingUnsub) waitingUnsub();
+      waitingUnsub = waitingDocRef.onSnapshot((snap) => {
+        const data = snap.data();
+        if (data?.matched && data?.roomId) {
+          currentRoomId = data.roomId;
+          currentRole = 'host';
+          if (waitingHbTimer) { clearInterval(waitingHbTimer); waitingHbTimer = null; }
+          if (waitingUnsub) { waitingUnsub(); waitingUnsub = null; }
+          waitingDocRef = null;
           enterRoomUI();
         }
       });
     }
 
-    // ===== 수동: 호스트 방 만들기 =====
+    async function cancelMatching() {
+      try {
+        if (waitingDocRef) {
+          await waitingDocRef.update({ active:false }).catch(()=>{});
+        }
+      } finally {
+        if (waitingUnsub) { waitingUnsub(); waitingUnsub = null; }
+        if (waitingHbTimer) { clearInterval(waitingHbTimer); waitingHbTimer = null; }
+        waitingDocRef = null;
+        hide(matchingBox);
+        show(document.getElementById('idleActions'));
+      }
+    }
+
+    // ========== 수동 모드 ==========
     async function createHostRoomManual() {
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
@@ -273,14 +310,15 @@
         nicks: { host: nickH },
         members: [currentUser.uid],
         connected: { host: true, guest: false },
-        ended: false
+        hb: { host: nowMs(), guest: 0 },
+        ended: false,
+        greeted: false
       });
 
       currentRoomId = roomDoc.id;
       currentRole   = 'host';
       setDebug();
 
-      // 방 코드 표시 + 복사 버튼 활성화
       roomCodeText.textContent = currentRoomId;
       shareHint.classList.remove('hidden');
 
@@ -294,7 +332,6 @@
       });
     }
 
-    // ===== 수동: 방 코드로 게스트 입장 =====
     async function joinAsGuestWithCode() {
       if (!currentUser) return;
 
@@ -326,11 +363,12 @@
               nicks: { host: nickH, guest: nickG },
               members: [room.host, currentUser.uid],
               connected: { host: true, guest: true },
-              ended: false
+              hb: { host: nowMs(), guest: nowMs() },
+              ended: false,
+              greeted: false
             });
           });
 
-          // 성공
           currentRoomId = code;
           currentRole   = 'guest';
           setDebug();
@@ -338,25 +376,21 @@
           return;
 
         } catch (e) {
-          console.error('[joinAsGuestWithCode] error:', e);
-
           if (e.code === 'aborted' && attempt < RETRY_LIMIT) {
             await new Promise(r => setTimeout(r, 200));
             continue;
           }
-
           const byMessage = {
             NOT_FOUND: '방을 찾을 수 없어요. 코드가 맞는지 확인해 주세요.',
             SELF_JOIN: '자신의 방에는 게스트로 입장할 수 없어요.',
             CLOSED: '이미 매칭이 완료된 방이에요. 새로운 코드를 받아주세요.'
           };
           const byCode = {
-            'permission-denied': '권한이 없어요. (Firebase 규칙/허용 도메인/App Check를 확인해 주세요.)',
-            'failed-precondition': '사전 조건이 충족되지 않았어요. (App Check/설정 확인)',
-            'not-found': '방을 찾을 수 없어요. 코드가 맞는지 확인해 주세요.',
-            'cancelled': '요청이 취소되었어요. 다시 시도해 주세요.'
+            'permission-denied': '권한이 없어요. (Firebase 규칙/허용 도메인/App Check 확인)',
+            'failed-precondition': '사전 조건이 충족되지 않았어요.',
+            'not-found': '방을 찾을 수 없어요.',
+            'cancelled': '요청이 취소되었어요.'
           };
-
           const msg = byMessage[e.message] || byCode[e.code] || '입장에 실패했어요. 코드와 상태를 확인해 주세요.';
           show(document.getElementById('idleActions'));
           hide(matchingBox);
@@ -366,7 +400,23 @@
       }
     }
 
-    // ===== 방 UI 진입 & 핸드셰이크/프레즌스 =====
+    // ========== 룸 입장 & 하트비트/프레즌스 ==========
+    function startRoomHeartbeat() {
+      if (!roomRef) return;
+      // 즉시 1회
+      roomRef.update({
+        [`connected.${roleKey()}`]: true,
+        [`hb.${roleKey()}`]: nowMs()
+      }).catch(()=>{});
+      // 5초마다 갱신
+      roomHbTimer = setInterval(() => {
+        roomRef.update({ [`hb.${roleKey()}`]: nowMs() }).catch(()=>{});
+      }, 5000);
+    }
+    function stopRoomHeartbeat() {
+      if (roomHbTimer) { clearInterval(roomHbTimer); roomHbTimer = null; }
+    }
+
     function enterRoomUI() {
       hide(matchingBox);
       show(chatSec);
@@ -374,33 +424,38 @@
       roomRef = db.collection('rooms').doc(currentRoomId);
       setDebug();
 
-      // 닉/상태바
+      // 보호: 같은 UID로 페어링된 방은 종료
       roomRef.get().then(s => {
-        const d = s.data();
+        const d = s.data() || {};
+        const members = d.members || [];
+        const uniq = new Set(members);
+        if (uniq.size < 2) {
+          systemMessage('⚠️ 매칭 오류(동일 사용자 감지). 다시 시도해 주세요.');
+          leaveRoom(true);
+          return;
+        }
         const myNick = currentRole === 'host' ? d.nicks.host : d.nicks.guest;
         const otherNick = currentRole === 'host' ? d.nicks.guest : d.nicks.host;
         nickbar.textContent = `${myNick} • 상대: ${otherNick || '대기중...'}`;
       });
 
-      // 내가 화면에 진입했음을 표시(핸드셰이크)
-      const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
-      roomRef.update({ [connField]: true }).catch(()=>{});
+      // 하트비트 시작
+      startRoomHeartbeat();
 
-      // 방 상태/퇴장 감시 → 시스템 메시지
+      // 방 상태 구독
       if (roomUnsub) roomUnsub();
       roomUnsub = roomRef.onSnapshot(snap => {
         const d = snap.data() || {};
-        const otherConn = currentRole === 'host' ? d.connected?.guest : d.connected?.host;
-        const ended = d.ended;
+        const otherHb = d.hb?.[otherRoleKey()] || 0;
+        const alive = (nowMs() - otherHb) <= 10000; // 10초 내 신호
+        statusbar.textContent = alive ? '상대 연결됨' : '상대 입장 대기중...';
 
-        statusbar.textContent = otherConn ? '상대 연결됨' : '상대 입장 대기중...';
-
-        if (ended) {
+        if (d.ended) {
           systemMessage('상대가 나갔습니다. (채팅 종료됨)');
         }
       });
 
-      // 메시지 실시간 수신
+      // 메시지 구독
       if (msgUnsub) msgUnsub();
       msgUnsub = roomRef.collection('messages')
         .orderBy('createdAt', 'asc')
@@ -425,54 +480,31 @@
           messages.scrollTop = messages.scrollHeight;
         });
 
-      // 두 명 모두 들어왔을 때 "연결 완료" 시스템 메시지(중복 방지용 read-modify)
+      // 연결 완료 안내(1회)
       roomRef.get().then(s => {
         const d = s.data() || {};
         const both = d.connected?.host && d.connected?.guest;
         if (both && !d.greeted) {
-          roomRef.update({ greeted: true }).then(()=> {
+          roomRef.update({ greeted: true }).then(() => {
             postSystemMessageToRoom('✅ 연결 완료! 이제 메시지를 주고받을 수 있어요.');
           }).catch(()=>{});
         }
       });
     }
 
-    // ===== 취소/나가기/메시지 =====
-    async function cancelMatching() {
-      // 열린 자기 방은 정리
-      if (currentRole === 'host' && currentRoomId) {
-        const ref = db.collection('rooms').doc(currentRoomId);
-        const snap = await ref.get();
-        if (snap.exists && snap.data().open && !snap.data().guest) {
-          await ref.delete().catch(()=>{});
-        }
-      }
-      currentRoomId = null; currentRole = null;
-      if (roomUnsub) { roomUnsub(); roomUnsub = null; }
-      if (msgUnsub) { msgUnsub(); msgUnsub = null; }
-      hide(matchingBox);
-      show(document.getElementById('idleActions'));
-      shareHint.classList.add('hidden');
-      setDebug();
-    }
-
+    // ========== 종료/전송 ==========
     async function leaveRoom(navigateHome = true) {
       try {
+        stopRoomHeartbeat();
         if (currentRoomId) {
           const ref = db.collection('rooms').doc(currentRoomId);
-
-          // 상대에게 보일 시스템 메시지
           await ref.collection('messages').add({
-            uid: '__system__',
-            text: '상대가 나갔습니다.',
-            type: 'system',
+            uid: '__system__', type: 'system', text: '상대가 나갔습니다.',
             createdAt: firebase.firestore.FieldValue.serverTimestamp()
           });
-
-          // 프레즌스/종료 표시
-          const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
           await ref.update({
-            [connField]: false,
+            [`connected.${roleKey()}`]: false,
+            [`hb.${roleKey()}`]: 0,
             ended: true
           }).catch(()=>{});
         }
@@ -481,7 +513,7 @@
         if (roomUnsub) { roomUnsub(); roomUnsub = null; }
         currentRoomId = null; currentRole = null;
         hide(chatSec);
-        if (navigateHome) { show(home); show(document.getElementById('idleActions')); }
+        show(home); show(document.getElementById('idleActions'));
         messages.innerHTML = '';
         statusbar.textContent = '';
         setDebug();
@@ -490,24 +522,34 @@
 
     async function sendMessage(text) {
       if (!text || !currentRoomId) return;
-      await db.collection('rooms').doc(currentRoomId).collection('messages')
-        .add({
-          uid: currentUser.uid,
-          text,
-          createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        }).catch(()=>{});
+      await db.collection('rooms').doc(currentRoomId).collection('messages').add({
+        uid: currentUser.uid,
+        text,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(()=>{});
     }
 
-    // 이벤트 바인딩
+    // ========== 이벤트 ==========
     btnStart.addEventListener('click', startMatching);
     btnCancel.addEventListener('click', cancelMatching);
     btnLeave.addEventListener('click', () => leaveRoom(true));
+
     form.addEventListener('submit', e => {
       e.preventDefault();
       const t = input.value.trim();
       if (!t) return;
-      sendMessage(t);
-      input.value = '';
+      // 선택: 상대 하트비트 확인 후 전송
+      roomRef.get().then(s => {
+        const d = s.data() || {};
+        const otherHb = d.hb?.[otherRoleKey()] || 0;
+        const alive = (nowMs() - otherHb) <= 10000;
+        if (!alive) {
+          systemMessage('⏳ 아직 상대가 완전히 연결되지 않았어요. 잠시만 기다려 주세요.');
+          return;
+        }
+        sendMessage(t);
+        input.value = '';
+      });
     });
 
     btnHostManual.addEventListener('click', createHostRoomManual);
@@ -519,18 +561,19 @@
       catch { alert('복사 실패! 코드를 직접 선택해 복사해 주세요.'); }
     });
 
-    // 탭 닫기/새로고침 시 프레즌스 업데이트 & 시스템 메시지 (best-effort)
-    window.addEventListener('beforeunload', (e) => {
+    // 탭 종료 시 대기표/방 정리
+    window.addEventListener('beforeunload', () => {
+      if (waitingDocRef) {
+        waitingDocRef.update({ active:false }).catch(()=>{});
+      }
       if (currentRoomId) {
+        stopRoomHeartbeat();
         const ref = db.collection('rooms').doc(currentRoomId);
-        const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
         ref.collection('messages').add({
-          uid: '__system__',
-          text: '상대가 나갔습니다.',
-          type: 'system',
+          uid: '__system__', type: 'system', text: '상대가 나갔습니다.',
           createdAt: firebase.firestore.FieldValue.serverTimestamp()
         }).catch(()=>{});
-        ref.update({ [connField]: false, ended: true }).catch(()=>{});
+        ref.update({ [`connected.${roleKey()}`]: false, [`hb.${roleKey()}`]: 0, ended: true }).catch(()=>{});
       }
     });
   </script>
