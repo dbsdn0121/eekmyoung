@@ -135,9 +135,9 @@
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
+      // 🔧 인덱스 없이도 동작하도록 orderBy 제거
       const openSnap = await db.collection('rooms')
         .where('open','==',true)
-        .orderBy('createdAt','asc')
         .limit(1)
         .get();
 
@@ -159,7 +159,7 @@
           currentRoomId = doc.id;
           currentRole = 'guest';
           enterRoomUI();
-          subscribeRoom(doc.id);
+          // subscribeRoom 호출 제거 (enterRoomUI가 구독 처리)
           return;
         } catch(e){}
       }
@@ -179,7 +179,7 @@
         const d = snap.data();
         if (d?.guest && d.open === false) {
           enterRoomUI();
-          subscribeRoom(roomDoc.id);
+          // subscribeRoom 호출 제거
         }
       });
     }
