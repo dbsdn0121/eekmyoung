@@ -198,16 +198,21 @@
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
-      // 1) 먼저 대기 중인 타 유저가 있으면 트랜잭션으로 매칭
-      const snapshot = await db.collection('waiting')
-        .where('active','==',true)
-        .orderBy('createdAt','asc')
-        .limit(5)
-        .get();
+      // 1) "active == true" 인 대기표를 불러오고, createdAt은 클라이언트에서 정렬 (인덱스 필요 없음)
+      const raw = await db.collection('waiting').where('active','==',true).get();
+      const sortedDocs = raw.docs
+        .map(d => ({ ref: d.ref, data: () => d.data() }))
+        .sort((a, b) => {
+          const ca = a.data().createdAt?.toMillis?.() ?? 0;
+          const cb = b.data().createdAt?.toMillis?.() ?? 0;
+          return ca - cb;
+        })
+        .slice(0, 5);
 
-      const others = snapshot.docs.filter(d => d.data().uid !== currentUser.uid);
+      const others = sortedDocs.filter(d => d.data().uid !== currentUser.uid);
 
       if (others.length > 0) {
+        // 2) 가장 오래 대기한 사람과 트랜잭션 매칭
         const candidate = others[0];
         try {
           const roomId = await db.runTransaction(async (tx) => {
@@ -253,7 +258,7 @@
         }
       }
 
-      // 2) 내가 대기표 생성 (선착)
+      // 3) 내가 대기표 생성 (선착)
       waitingDocRef = await db.collection('waiting').add({
         uid: currentUser.uid,
         active: true,
@@ -267,7 +272,7 @@
         waitingDocRef.update({ hb: nowMs() }).catch(()=>{});
       }, 5000);
 
-      // 3) 내 대기표 구독: roomId 세팅되면 host로 입장
+      // 4) 내 대기표 구독: roomId 세팅되면 host로 입장
       if (waitingUnsub) waitingUnsub();
       waitingUnsub = waitingDocRef.onSnapshot((snap) => {
         const data = snap.data();
@@ -443,7 +448,7 @@
       startRoomHeartbeat();
 
       // 방 상태 구독
-      if (roomUnsub) roomUnsub();
+      if (roomUnsub) roomUnsub = null;
       roomUnsub = roomRef.onSnapshot(snap => {
         const d = snap.data() || {};
         const otherHb = d.hb?.[otherRoleKey()] || 0;
@@ -456,7 +461,7 @@
       });
 
       // 메시지 구독
-      if (msgUnsub) msgUnsub();
+      if (msgUnsub) msgUnsub = null;
       msgUnsub = roomRef.collection('messages')
         .orderBy('createdAt', 'asc')
         .onSnapshot(snap => {
