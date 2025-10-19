@@ -71,6 +71,7 @@
         <div>
           <div class="text-sm text-slate-500">상대와 익명 채팅</div>
           <div id="nickbar" class="font-semibold"></div>
+          <div id="statusbar" class="text-xs text-slate-500"></div>
         </div>
         <button id="btnLeave" class="px-3 py-2 rounded-lg bg-slate-200 text-sm">나가기</button>
       </div>
@@ -119,6 +120,7 @@
     const dbgRole = document.getElementById('dbgRole');
     const chatSec = document.getElementById('chat');
     const nickbar = document.getElementById('nickbar');
+    const statusbar = document.getElementById('statusbar');
     const messages = document.getElementById('messages');
     const form = document.getElementById('messageForm');
     const input = document.getElementById('messageInput');
@@ -137,6 +139,7 @@
     let currentRole = null;   // 'host' | 'guest'
     let roomUnsub = null;
     let msgUnsub = null;
+    let roomRef = null;
 
     const ADJ = ['푸른','은하','순수','초록','고요','깊은','맑은','번쩍','은빛','따뜻'];
     const ANM = ['여우','수달','돌고래','펭귄','고래','고양이','사자','부엉이','라쿤','두더지'];
@@ -160,12 +163,32 @@
       setDebug();
     });
 
-    // === 자동 매칭 (경합 내성 + 백오프 재시도) ===
+    // ===== 공통 유틸 =====
+    function systemMessage(text) {
+      const line = document.createElement('div');
+      line.className = 'text-center text-xs text-slate-500 my-2';
+      line.textContent = text;
+      messages.appendChild(line);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function postSystemMessageToRoom(text) {
+      if (!currentRoomId) return;
+      await db.collection('rooms').doc(currentRoomId).collection('messages').add({
+        uid: '__system__',
+        text,
+        type: 'system',
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(()=>{});
+    }
+
+    // ===== 자동 매칭 =====
     async function startMatching() {
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
+      // 열린 방을 잡아 Guest로 붙는 시도
       const tryJoinOnce = async () => {
         const snap = await db.collection('rooms')
           .where('open','==',true)
@@ -187,7 +210,10 @@
               tx.update(ref, {
                 guest: currentUser.uid,
                 open: false,
-                nicks: { host: nickH, guest: nickG }
+                nicks: { host: nickH, guest: nickG },
+                members: [room.host, currentUser.uid],
+                connected: { host: true, guest: true },
+                ended: false
               });
             });
             currentRoomId = ref.id;
@@ -201,10 +227,11 @@
         return false;
       };
 
-      for (let i = 0; i < 3; i++) {
+      // 경합 대비: 백오프 포함 다회 시도
+      for (let i = 0; i < 5; i++) {
         const ok = await tryJoinOnce();
         if (ok) return;
-        await new Promise(r => setTimeout(r, 200 + i * 200));
+        await new Promise(r => setTimeout(r, 200 + i * 250));
       }
 
       // 실패 → 내가 host로 대기
@@ -213,7 +240,10 @@
         open: true,
         host: currentUser.uid,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        nicks: { host: nickH }
+        nicks: { host: nickH },
+        members: [currentUser.uid],
+        connected: { host: true, guest: false },
+        ended: false
       });
       currentRoomId = roomDoc.id;
       currentRole = 'host';
@@ -222,13 +252,14 @@
       if (roomUnsub) roomUnsub();
       roomUnsub = roomDoc.onSnapshot(snap => {
         const d = snap.data();
+        // 게스트가 붙으면 입장
         if (d?.guest && d.open === false) {
           enterRoomUI();
         }
       });
     }
 
-    // === 수동: 호스트 방 만들기 (코드 공유) ===
+    // ===== 수동: 호스트 방 만들기 =====
     async function createHostRoomManual() {
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
@@ -239,7 +270,10 @@
         open: true,
         host: currentUser.uid,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        nicks: { host: nickH }
+        nicks: { host: nickH },
+        members: [currentUser.uid],
+        connected: { host: true, guest: false },
+        ended: false
       });
 
       currentRoomId = roomDoc.id;
@@ -260,11 +294,10 @@
       });
     }
 
-    // === 수동: 방 코드로 게스트 입장 (강화된 에러 핸들링 + 재시도) ===
+    // ===== 수동: 방 코드로 게스트 입장 =====
     async function joinAsGuestWithCode() {
       if (!currentUser) return;
 
-      // 공백/개행 제거(복붙 시 보이지 않는 공백 대비)
       const raw = roomCodeInput.value;
       const code = (raw || "").replace(/\s+/g, "").trim();
       if (!code) { alert('방 코드를 입력해 주세요.'); return; }
@@ -273,7 +306,7 @@
       show(matchingBox);
 
       const ref = db.collection('rooms').doc(code);
-      const RETRY_LIMIT = 1; // 경합(aborted) 1회 재시도
+      const RETRY_LIMIT = 1;
 
       for (let attempt = 0; attempt <= RETRY_LIMIT; attempt++) {
         try {
@@ -290,11 +323,14 @@
             tx.update(ref, {
               guest: currentUser.uid,
               open: false,
-              nicks: { host: nickH, guest: nickG }
+              nicks: { host: nickH, guest: nickG },
+              members: [room.host, currentUser.uid],
+              connected: { host: true, guest: true },
+              ended: false
             });
           });
 
-          // ✅ 성공
+          // 성공
           currentRoomId = code;
           currentRole   = 'guest';
           setDebug();
@@ -304,7 +340,6 @@
         } catch (e) {
           console.error('[joinAsGuestWithCode] error:', e);
 
-          // 경합(동시 입장) → 한 번 재시도
           if (e.code === 'aborted' && attempt < RETRY_LIMIT) {
             await new Promise(r => setTimeout(r, 200));
             continue;
@@ -331,11 +366,15 @@
       }
     }
 
+    // ===== 방 UI 진입 & 핸드셰이크/프레즌스 =====
     function enterRoomUI() {
       hide(matchingBox);
       show(chatSec);
-      const roomRef = db.collection('rooms').doc(currentRoomId);
 
+      roomRef = db.collection('rooms').doc(currentRoomId);
+      setDebug();
+
+      // 닉/상태바
       roomRef.get().then(s => {
         const d = s.data();
         const myNick = currentRole === 'host' ? d.nicks.host : d.nicks.guest;
@@ -343,6 +382,25 @@
         nickbar.textContent = `${myNick} • 상대: ${otherNick || '대기중...'}`;
       });
 
+      // 내가 화면에 진입했음을 표시(핸드셰이크)
+      const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
+      roomRef.update({ [connField]: true }).catch(()=>{});
+
+      // 방 상태/퇴장 감시 → 시스템 메시지
+      if (roomUnsub) roomUnsub();
+      roomUnsub = roomRef.onSnapshot(snap => {
+        const d = snap.data() || {};
+        const otherConn = currentRole === 'host' ? d.connected?.guest : d.connected?.host;
+        const ended = d.ended;
+
+        statusbar.textContent = otherConn ? '상대 연결됨' : '상대 입장 대기중...';
+
+        if (ended) {
+          systemMessage('상대가 나갔습니다. (채팅 종료됨)');
+        }
+      });
+
+      // 메시지 실시간 수신
       if (msgUnsub) msgUnsub();
       msgUnsub = roomRef.collection('messages')
         .orderBy('createdAt', 'asc')
@@ -350,6 +408,13 @@
           messages.innerHTML = '';
           snap.forEach(doc => {
             const m = doc.data();
+            if (m.type === 'system') {
+              const line = document.createElement('div');
+              line.className = 'text-center text-xs text-slate-500 my-2';
+              line.textContent = m.text;
+              messages.appendChild(line);
+              return;
+            }
             const isMe = m.uid === currentUser.uid;
             const wrap = document.createElement('div');
             wrap.className = `flex ${isMe ? 'justify-end' : ''}`;
@@ -359,8 +424,20 @@
           });
           messages.scrollTop = messages.scrollHeight;
         });
+
+      // 두 명 모두 들어왔을 때 "연결 완료" 시스템 메시지(중복 방지용 read-modify)
+      roomRef.get().then(s => {
+        const d = s.data() || {};
+        const both = d.connected?.host && d.connected?.guest;
+        if (both && !d.greeted) {
+          roomRef.update({ greeted: true }).then(()=> {
+            postSystemMessageToRoom('✅ 연결 완료! 이제 메시지를 주고받을 수 있어요.');
+          }).catch(()=>{});
+        }
+      });
     }
 
+    // ===== 취소/나가기/메시지 =====
     async function cancelMatching() {
       // 열린 자기 방은 정리
       if (currentRole === 'host' && currentRoomId) {
@@ -372,6 +449,7 @@
       }
       currentRoomId = null; currentRole = null;
       if (roomUnsub) { roomUnsub(); roomUnsub = null; }
+      if (msgUnsub) { msgUnsub(); msgUnsub = null; }
       hide(matchingBox);
       show(document.getElementById('idleActions'));
       shareHint.classList.add('hidden');
@@ -379,13 +457,35 @@
     }
 
     async function leaveRoom(navigateHome = true) {
-      if (msgUnsub) { msgUnsub(); msgUnsub = null; }
-      if (roomUnsub) { roomUnsub(); roomUnsub = null; }
-      currentRoomId = null; currentRole = null;
-      hide(chatSec);
-      if (navigateHome) { show(home); show(document.getElementById('idleActions')); }
-      messages.innerHTML = '';
-      setDebug();
+      try {
+        if (currentRoomId) {
+          const ref = db.collection('rooms').doc(currentRoomId);
+
+          // 상대에게 보일 시스템 메시지
+          await ref.collection('messages').add({
+            uid: '__system__',
+            text: '상대가 나갔습니다.',
+            type: 'system',
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+          });
+
+          // 프레즌스/종료 표시
+          const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
+          await ref.update({
+            [connField]: false,
+            ended: true
+          }).catch(()=>{});
+        }
+      } finally {
+        if (msgUnsub) { msgUnsub(); msgUnsub = null; }
+        if (roomUnsub) { roomUnsub(); roomUnsub = null; }
+        currentRoomId = null; currentRole = null;
+        hide(chatSec);
+        if (navigateHome) { show(home); show(document.getElementById('idleActions')); }
+        messages.innerHTML = '';
+        statusbar.textContent = '';
+        setDebug();
+      }
     }
 
     async function sendMessage(text) {
@@ -395,7 +495,7 @@
           uid: currentUser.uid,
           text,
           createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        });
+        }).catch(()=>{});
     }
 
     // 이벤트 바인딩
@@ -419,15 +519,18 @@
       catch { alert('복사 실패! 코드를 직접 선택해 복사해 주세요.'); }
     });
 
-    // 탭 닫기 시 열린 방 정리 (best-effort)
-    window.addEventListener('beforeunload', () => {
-      if (currentRole === 'host' && currentRoomId) {
+    // 탭 닫기/새로고침 시 프레즌스 업데이트 & 시스템 메시지 (best-effort)
+    window.addEventListener('beforeunload', (e) => {
+      if (currentRoomId) {
         const ref = db.collection('rooms').doc(currentRoomId);
-        ref.get().then(s=>{
-          if (s.exists && s.data().open && !s.data().guest) {
-            ref.delete().catch(()=>{});
-          }
-        });
+        const connField = currentRole === 'host' ? 'connected.host' : 'connected.guest';
+        ref.collection('messages').add({
+          uid: '__system__',
+          text: '상대가 나갔습니다.',
+          type: 'system',
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        }).catch(()=>{});
+        ref.update({ [connField]: false, ended: true }).catch(()=>{});
       }
     });
   </script>
