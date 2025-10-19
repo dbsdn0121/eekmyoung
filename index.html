@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>익명 1:1 채팅</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body { height: 100%; }
+    .scrollbar-thin::-webkit-scrollbar { height: 6px; width: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+  <div class="max-w-md mx-auto px-4 py-8">
+    <header class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold">익명 1:1 채팅</h1>
+      <span id="authBadge" class="text-xs text-slate-500">연결 준비중...</span>
+    </header>
+
+    <section id="home" class="rounded-2xl bg-white shadow p-6 hidden">
+      <h2 class="text-lg font-semibold mb-2">랜덤 익명 매칭</h2>
+      <p class="text-slate-600 mb-4">버튼을 누르면 익명의 상대를 찾아 연결합니다.</p>
+
+      <div id="idleActions" class="space-y-3">
+        <button id="btnStart" class="w-full py-3 rounded-xl bg-emerald-600 text-white font-semibold">
+          익명 채팅 시작하기
+        </button>
+      </div>
+
+      <div id="matching" class="hidden flex flex-col items-center justify-center gap-3 py-8">
+        <div class="animate-spin w-8 h-8 border-4 border-slate-200 border-t-indigo-600 rounded-full"></div>
+        <p class="text-sm text-slate-700">채팅자 찾는중..</p>
+        <button id="btnCancel" class="px-4 py-2 rounded-lg bg-slate-200 text-slate-800 text-sm">취소</button>
+      </div>
+
+      <details class="mt-4 text-sm text-slate-500">
+        <summary class="cursor-pointer">연결 상태</summary>
+        <div class="mt-2 space-y-1">
+          <div>내 UID: <span id="dbgUid">-</span></div>
+          <div>룸 ID: <span id="dbgRoom">-</span></div>
+          <div>역할: <span id="dbgRole">-</span></div>
+        </div>
+      </details>
+    </section>
+
+    <section id="chat" class="hidden rounded-2xl bg-white shadow flex flex-col h-[70vh]">
+      <div class="flex items-center justify-between p-4 border-b">
+        <div>
+          <div class="text-sm text-slate-500">상대와 익명 채팅</div>
+          <div id="nickbar" class="font-semibold"></div>
+        </div>
+        <button id="btnLeave" class="px-3 py-2 rounded-lg bg-slate-200 text-sm">나가기</button>
+      </div>
+
+      <div id="messages" class="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-thin bg-slate-50"></div>
+
+      <form id="messageForm" class="p-3 border-t flex gap-2">
+        <input id="messageInput" class="flex-1 px-3 py-2 rounded-lg border" placeholder="메시지를 입력..." autocomplete="off" />
+        <button class="px-4 py-2 rounded-lg bg-indigo-600 text-white">전송</button>
+      </form>
+    </section>
+  </div>
+
+  <!-- Firebase SDK (Compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+
+  <script>
+    // === 1) Firebase 초기화 ===
+    const firebaseConfig = {
+      apiKey: "AIzaSyACfmI0SvAFEEjlFTkkoI1leGoZ-IYj9iI",
+      authDomain: "eekmyoung-b85f9.firebaseapp.com",
+      projectId: "eekmyoung-b85f9",
+      storageBucket: "eekmyoung-b85f9.appspot.com",
+      messagingSenderId: "576568352493",
+      appId: "1:576568352493:web:57784642885f24115576e4",
+      measurementId: "G-ZQYHMN5BBL"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+
+    // === 2) 익명 로그인 ===
+    auth.signInAnonymously().catch(console.error);
+
+    // === DOM 요소 ===
+    const authBadge = document.getElementById('authBadge');
+    const home = document.getElementById('home');
+    const matchingBox = document.getElementById('matching');
+    const btnStart = document.getElementById('btnStart');
+    const btnCancel = document.getElementById('btnCancel');
+    const btnLeave = document.getElementById('btnLeave');
+    const dbgUid = document.getElementById('dbgUid');
+    const dbgRoom = document.getElementById('dbgRoom');
+    const dbgRole = document.getElementById('dbgRole');
+    const chatSec = document.getElementById('chat');
+    const nickbar = document.getElementById('nickbar');
+    const messages = document.getElementById('messages');
+    const form = document.getElementById('messageForm');
+    const input = document.getElementById('messageInput');
+
+    // === 상태 ===
+    let currentUser = null;
+    let currentRoomId = null;
+    let currentRole = null;
+    let roomUnsub = null;
+    let msgUnsub = null;
+
+    const ADJ = ['푸른','은하','순수','초록','고요','깊은','맑은','번쩍','은빛','따뜻'];
+    const ANM = ['여우','수달','돌고래','펭귄','고래','고양이','사자','부엉이','라쿤','두더지'];
+    const pickNick = () => `${ADJ[Math.floor(Math.random()*ADJ.length)]} ${ANM[Math.floor(Math.random()*ANM.length)]}`;
+
+    const show = el => el.classList.remove('hidden');
+    const hide = el => el.classList.add('hidden');
+    const setDebug = () => {
+      dbgUid.textContent = currentUser?.uid || '-';
+      dbgRoom.textContent = currentRoomId || '-';
+      dbgRole.textContent = currentRole || '-';
+    };
+
+    auth.onAuthStateChanged(user => {
+      currentUser = user || null;
+      if (user) {
+        authBadge.textContent = '익명 접속 완료';
+        show(home);
+      }
+      setDebug();
+    });
+
+    // === 매칭 ===
+    async function startMatching() {
+      if (!currentUser) return;
+      hide(document.getElementById('idleActions'));
+      show(matchingBox);
+
+      const openSnap = await db.collection('rooms')
+        .where('open','==',true)
+        .orderBy('createdAt','asc')
+        .limit(1)
+        .get();
+
+      if (!openSnap.empty) {
+        const doc = openSnap.docs[0].ref;
+        try {
+          await db.runTransaction(async tx => {
+            const s = await tx.get(doc);
+            if (!s.exists) throw new Error();
+            const d = s.data();
+            if (!d.open) throw new Error();
+
+            tx.update(doc, {
+              guest: currentUser.uid,
+              open: false,
+              nicks: { host: d.nicks?.host || pickNick(), guest: pickNick() }
+            });
+          });
+          currentRoomId = doc.id;
+          currentRole = 'guest';
+          enterRoomUI();
+          subscribeRoom(doc.id);
+          return;
+        } catch(e){}
+      }
+
+      const nickH = pickNick();
+      const roomDoc = await db.collection('rooms').add({
+        open: true,
+        host: currentUser.uid,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        nicks: { host: nickH }
+      });
+      currentRoomId = roomDoc.id;
+      currentRole = 'host';
+      setDebug();
+
+      roomUnsub = roomDoc.onSnapshot(snap => {
+        const d = snap.data();
+        if (d?.guest && d.open === false) {
+          enterRoomUI();
+          subscribeRoom(roomDoc.id);
+        }
+      });
+    }
+
+    function enterRoomUI() {
+      hide(matchingBox);
+      show(chatSec);
+      const roomRef = db.collection('rooms').doc(currentRoomId);
+
+      roomRef.get().then(s=>{
+        const d = s.data();
+        const myNick = currentRole==='host'? d.nicks.host : d.nicks.guest;
+        const otherNick = currentRole==='host'? d.nicks.guest : d.nicks.host;
+        nickbar.textContent = `${myNick} • 상대: ${otherNick || '대기중...'}`;
+      });
+
+      if (msgUnsub) msgUnsub();
+      msgUnsub = roomRef.collection('messages')
+        .orderBy('createdAt','asc')
+        .onSnapshot(snap=>{
+          messages.innerHTML = '';
+          snap.forEach(doc=>{
+            const m = doc.data();
+            const isMe = m.uid === currentUser.uid;
+            const wrap = document.createElement('div');
+            wrap.className = `flex ${isMe?'justify-end':''}`;
+            wrap.innerHTML = `<div class="max-w-[80%] px-3 py-2 rounded-xl ${isMe?'bg-indigo-600 text-white':'bg-slate-200 text-slate-900'}">${m.text}</div>`;
+            messages.appendChild(wrap);
+          });
+          messages.scrollTop = messages.scrollHeight;
+        });
+    }
+
+    async function cancelMatching() {
+      if (currentRole==='host' && currentRoomId) {
+        const ref = db.collection('rooms').doc(currentRoomId);
+        const snap = await ref.get();
+        if (snap.exists && snap.data().open && !snap.data().guest) {
+          await ref.delete().catch(()=>{});
+        }
+      }
+      currentRoomId=null; currentRole=null;
+      if (roomUnsub) { roomUnsub(); roomUnsub=null; }
+      hide(matchingBox);
+      show(document.getElementById('idleActions'));
+      setDebug();
+    }
+
+    async function leaveRoom(navigateHome=true) {
+      if (msgUnsub) { msgUnsub(); msgUnsub=null; }
+      if (roomUnsub) { roomUnsub(); roomUnsub=null; }
+      currentRoomId=null; currentRole=null;
+      hide(chatSec);
+      if (navigateHome){ show(home); show(document.getElementById('idleActions')); }
+      messages.innerHTML='';
+      setDebug();
+    }
+
+    async function sendMessage(text) {
+      if (!text || !currentRoomId) return;
+      await db.collection('rooms').doc(currentRoomId).collection('messages')
+        .add({ uid: currentUser.uid, text, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+    }
+
+    btnStart.addEventListener('click', startMatching);
+    btnCancel.addEventListener('click', cancelMatching);
+    btnLeave.addEventListener('click', ()=>leaveRoom(true));
+    form.addEventListener('submit', e=>{
+      e.preventDefault();
+      const t=input.value.trim();
+      if(!t)return;
+      sendMessage(t);
+      input.value='';
+    });
+  </script>
+</body>
+</html>
