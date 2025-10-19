@@ -18,22 +18,43 @@
       <span id="authBadge" class="text-xs text-slate-500" title="">연결 준비중...</span>
     </header>
 
+    <!-- 홈 화면 -->
     <section id="home" class="rounded-2xl bg-white shadow p-6 hidden">
       <h2 class="text-lg font-semibold mb-2">랜덤 익명 매칭</h2>
-      <p class="text-slate-600 mb-4">버튼을 누르면 익명의 상대를 찾아 연결합니다.</p>
+      <p class="text-slate-600 mb-4">아래 중 원하는 방식으로 시작하세요.</p>
 
+      <!-- 자동 매칭 -->
       <div id="idleActions" class="space-y-3">
         <button id="btnStart" class="w-full py-3 rounded-xl bg-emerald-600 text-white font-semibold">
-          익명 채팅 시작하기
+          익명 채팅 시작하기 (자동 매칭)
         </button>
       </div>
 
+      <!-- 매칭중 -->
       <div id="matching" class="hidden flex flex-col items-center justify-center gap-3 py-8">
         <div class="animate-spin w-8 h-8 border-4 border-slate-200 border-t-indigo-600 rounded-full"></div>
         <p class="text-sm text-slate-700">채팅자 찾는중..</p>
         <button id="btnCancel" class="px-4 py-2 rounded-lg bg-slate-200 text-slate-800 text-sm">취소</button>
       </div>
 
+      <!-- 수동 모드 (방 코드) -->
+      <div class="mt-6 border-t pt-4 space-y-2">
+        <h3 class="text-sm font-semibold text-slate-600">수동 입장 (방 코드 공유)</h3>
+        <button id="btnHostManual" class="w-full py-2 rounded-lg bg-slate-800 text-white text-sm">호스트 방 만들기</button>
+
+        <div class="flex gap-2">
+          <input id="roomCodeInput" class="flex-1 px-3 py-2 rounded-lg border" placeholder="방 코드 입력(문서 ID)" />
+          <button id="btnJoinManual" class="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm">게스트 입장</button>
+        </div>
+
+        <div id="shareHint" class="hidden text-xs text-slate-600 bg-slate-100 rounded-lg p-2">
+          내 방 코드: <b id="roomCodeText"></b>
+          <button id="btnCopyCode" class="ml-2 px-2 py-0.5 rounded bg-slate-300 text-slate-800">복사</button>
+          <span class="ml-1 text-[11px] text-slate-500">(친구가 위 코드를 입력하면 연결됩니다)</span>
+        </div>
+      </div>
+
+      <!-- 디버그 -->
       <details class="mt-4 text-sm text-slate-500">
         <summary class="cursor-pointer">연결 상태</summary>
         <div class="mt-2 space-y-1">
@@ -44,7 +65,8 @@
       </details>
     </section>
 
-    <section id="chat" class="hidden rounded-2xl bg-white shadow flex flex-col h-[70vh]">
+    <!-- 채팅 화면 -->
+    <section id="chat" class="hidden rounded-2xl bg-white shadow flex flex-col h-[70vh] mt-6">
       <div class="flex items-center justify-between p-4 border-b">
         <div>
           <div class="text-sm text-slate-500">상대와 익명 채팅</div>
@@ -101,6 +123,14 @@
     const form = document.getElementById('messageForm');
     const input = document.getElementById('messageInput');
 
+    // 수동 모드 DOM
+    const btnHostManual = document.getElementById('btnHostManual');
+    const btnJoinManual = document.getElementById('btnJoinManual');
+    const roomCodeInput = document.getElementById('roomCodeInput');
+    const shareHint = document.getElementById('shareHint');
+    const roomCodeText = document.getElementById('roomCodeText');
+    const btnCopyCode = document.getElementById('btnCopyCode');
+
     // === 상태 ===
     let currentUser = null;
     let currentRoomId = null;
@@ -124,21 +154,19 @@
       currentUser = user || null;
       if (user) {
         authBadge.textContent = '익명 접속 완료';
-        // 디버그: 프로젝트 확인 (같은 프로젝트인지)
         authBadge.title = `projectId: ${firebase.app().options.projectId}`;
         show(home);
       }
       setDebug();
     });
 
-    // === 매칭 (경합 내성 강화) ===
+    // === 자동 매칭 (경합 내성 + 백오프 재시도) ===
     async function startMatching() {
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
       const tryJoinOnce = async () => {
-        // 열린 방 여러 개를 시도 (인덱스 없이 동작)
         const snap = await db.collection('rooms')
           .where('open','==',true)
           .limit(5)
@@ -152,8 +180,6 @@
               if (!s.exists) throw new Error('gone');
               const room = s.data();
               if (!room.open) throw new Error('closed');
-
-              // 자기 방에는 게스트로 못 들어감
               if (room.host === currentUser.uid) throw new Error('self');
 
               const nickG = pickNick();
@@ -164,8 +190,6 @@
                 nicks: { host: nickH, guest: nickG }
               });
             });
-
-            // 게스트로 성공
             currentRoomId = ref.id;
             currentRole = 'guest';
             enterRoomUI();
@@ -177,7 +201,6 @@
         return false;
       };
 
-      // 경합 완화: 백오프 재시도 3회
       for (let i = 0; i < 3; i++) {
         const ok = await tryJoinOnce();
         if (ok) return;
@@ -196,13 +219,89 @@
       currentRole = 'host';
       setDebug();
 
-      // 누군가 들어오면 매칭 완료
+      if (roomUnsub) roomUnsub();
       roomUnsub = roomDoc.onSnapshot(snap => {
         const d = snap.data();
         if (d?.guest && d.open === false) {
           enterRoomUI();
         }
       });
+    }
+
+    // === 수동: 호스트 방 만들기 (코드 공유) ===
+    async function createHostRoomManual() {
+      if (!currentUser) return;
+      hide(document.getElementById('idleActions'));
+      show(matchingBox);
+
+      const nickH = pickNick();
+      const roomDoc = await db.collection('rooms').add({
+        open: true,
+        host: currentUser.uid,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        nicks: { host: nickH }
+      });
+
+      currentRoomId = roomDoc.id;
+      currentRole   = 'host';
+      setDebug();
+
+      // 방 코드 표시 + 복사 버튼 활성화
+      roomCodeText.textContent = currentRoomId;
+      shareHint.classList.remove('hidden');
+
+      if (roomUnsub) roomUnsub();
+      roomUnsub = roomDoc.onSnapshot(snap => {
+        const d = snap.data();
+        if (d?.guest && d.open === false) {
+          shareHint.classList.add('hidden');
+          enterRoomUI();
+        }
+      });
+    }
+
+    // === 수동: 방 코드로 게스트 입장 ===
+    async function joinAsGuestWithCode() {
+      if (!currentUser) return;
+      const code = roomCodeInput.value.trim();
+      if (!code) { alert('방 코드를 입력해 주세요.'); return; }
+
+      hide(document.getElementById('idleActions'));
+      show(matchingBox);
+
+      const ref = db.collection('rooms').doc(code);
+      try {
+        await db.runTransaction(async tx => {
+          const s = await tx.get(ref);
+          if (!s.exists) throw new Error('NOT_FOUND');
+          const room = s.data();
+
+          if (room.host === currentUser.uid) throw new Error('SELF_JOIN');
+          if (!room.open) throw new Error('CLOSED');
+
+          const nickG = pickNick();
+          const nickH = room.nicks?.host || pickNick();
+          tx.update(ref, {
+            guest: currentUser.uid,
+            open: false,
+            nicks: { host: nickH, guest: nickG }
+          });
+        });
+
+        currentRoomId = code;
+        currentRole   = 'guest';
+        setDebug();
+        enterRoomUI();
+      } catch (e) {
+        show(document.getElementById('idleActions'));
+        hide(matchingBox);
+        const map = {
+          NOT_FOUND:'방을 찾을 수 없어요.',
+          SELF_JOIN:'자신의 방에는 게스트로 입장할 수 없어요.',
+          CLOSED:'이미 매칭이 완료된 방이에요.'
+        };
+        alert(map[e.message] || '입장에 실패했어요. 코드와 상태를 확인해 주세요.');
+      }
     }
 
     function enterRoomUI() {
@@ -236,6 +335,7 @@
     }
 
     async function cancelMatching() {
+      // 열린 자기 방은 정리
       if (currentRole === 'host' && currentRoomId) {
         const ref = db.collection('rooms').doc(currentRoomId);
         const snap = await ref.get();
@@ -247,6 +347,7 @@
       if (roomUnsub) { roomUnsub(); roomUnsub = null; }
       hide(matchingBox);
       show(document.getElementById('idleActions'));
+      shareHint.classList.add('hidden');
       setDebug();
     }
 
@@ -270,6 +371,7 @@
         });
     }
 
+    // 이벤트 바인딩
     btnStart.addEventListener('click', startMatching);
     btnCancel.addEventListener('click', cancelMatching);
     btnLeave.addEventListener('click', () => leaveRoom(true));
@@ -279,6 +381,27 @@
       if (!t) return;
       sendMessage(t);
       input.value = '';
+    });
+
+    btnHostManual.addEventListener('click', createHostRoomManual);
+    btnJoinManual.addEventListener('click', joinAsGuestWithCode);
+    btnCopyCode.addEventListener('click', async () => {
+      const code = roomCodeText.textContent.trim();
+      if (!code) return;
+      try { await navigator.clipboard.writeText(code); btnCopyCode.textContent='복사됨'; setTimeout(()=>btnCopyCode.textContent='복사',1000); }
+      catch { alert('복사 실패! 코드를 직접 선택해 복사해 주세요.'); }
+    });
+
+    // 탭 닫기 시 열린 방 정리 (best-effort)
+    window.addEventListener('beforeunload', () => {
+      if (currentRole === 'host' && currentRoomId) {
+        const ref = db.collection('rooms').doc(currentRoomId);
+        ref.get().then(s=>{
+          if (s.exists && s.data().open && !s.data().guest) {
+            ref.delete().catch(()=>{});
+          }
+        });
+      }
     });
   </script>
 </body>
