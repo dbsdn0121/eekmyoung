@@ -14,7 +14,13 @@
 <body class="min-h-screen bg-slate-50 text-slate-900">
   <div class="max-w-md mx-auto px-4 py-8">
     <header class="flex items-center justify-between mb-6">
-      <h1 class="text-2xl font-bold">익명 1:1 채팅</h1>
+      <div class="flex items-baseline gap-3">
+        <h1 class="text-2xl font-bold">익명 1:1 채팅</h1>
+        <!-- 온라인 인원 표시 -->
+        <span id="onlineBadge" class="text-xs font-semibold text-emerald-600">
+          online:0명
+        </span>
+      </div>
       <span id="authBadge" class="text-xs text-slate-500" title="">연결 준비중...</span>
     </header>
 
@@ -95,7 +101,7 @@
   <script>
     // === Firebase 초기화 ===
     const firebaseConfig = {
-      apiKey: "AIzaSyACfmI0SvAFEEjlFTkkoI1leGoZ-IYj9iI",
+      apiKey: "AIzaSyACfmI0SvAFEEjlFTkkoI1leGoZ-Ij9iI",
       authDomain: "eekmyoung-b85f9.firebaseapp.com",
       projectId: "eekmyoung-b85f9",
       storageBucket: "eekmyoung-b85f9.appspot.com",
@@ -110,6 +116,7 @@
 
     // === DOM ===
     const authBadge = document.getElementById('authBadge');
+    const onlineBadge = document.getElementById('onlineBadge');
     const home = document.getElementById('home');
     const matchingBox = document.getElementById('matching');
     const btnStart = document.getElementById('btnStart');
@@ -163,12 +170,82 @@
     const roleKey = () => currentRole === 'host' ? 'host' : 'guest';
     const otherRoleKey = () => currentRole === 'host' ? 'guest' : 'host';
 
+    // === Presence(접속자 카운트) ===
+    const presenceCol = db.collection('presence');
+    let presDocRef = null;
+    let presTimer = null;
+    let onlineUnsub = null;
+    const SESSION_ID = Math.random().toString(36).slice(2, 9); // 탭별 ID
+    const ONLINE_WINDOW = 10_000; // 최근 10초 이내를 온라인으로 간주
+
+    function subscribeOnlineCount() {
+      if (onlineUnsub) onlineUnsub();
+      onlineUnsub = presenceCol
+        .orderBy('hb', 'desc')
+        .limit(200)
+        .onSnapshot(snap => {
+          const now = nowMs();
+          let n = 0;
+          snap.forEach(doc => {
+            const d = doc.data() || {};
+            if (now - (d.hb || 0) <= ONLINE_WINDOW) n++;
+          });
+          if (onlineBadge) {
+            onlineBadge.textContent = `online:${n}명`;
+          }
+        });
+    }
+
+    function setPresenceStatus(status) {
+      // status: 'home' | 'matching' | 'room'
+      if (!currentUser || !presDocRef) return;
+      presDocRef.set({
+        uid: currentUser.uid,
+        sid: SESSION_ID,
+        status,
+        roomId: currentRoomId || null,
+        hb: nowMs(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }, { merge: true }).catch(()=>{});
+    }
+
+    function startPresence() {
+      if (!currentUser) return;
+      if (presDocRef) return; // 이미 시작돼있으면 무시
+      presDocRef = presenceCol.doc(`${currentUser.uid}_${SESSION_ID}`);
+      // 즉시 1회 기록
+      setPresenceStatus('home');
+      // 하트비트
+      presTimer = setInterval(() => {
+        if (!presDocRef) return;
+        presDocRef.update({
+          hb: nowMs(),
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        }).catch(()=>{});
+      }, 5000);
+      // 온라인 카운트 구독
+      subscribeOnlineCount();
+    }
+
+    function stopPresence() {
+      if (presTimer) { clearInterval(presTimer); presTimer = null; }
+      if (onlineUnsub) { onlineUnsub(); onlineUnsub = null; }
+      if (presDocRef) {
+        presDocRef.delete().catch(()=>{});
+        presDocRef = null;
+      }
+    }
+
     auth.onAuthStateChanged(user => {
       currentUser = user || null;
       if (user) {
         authBadge.textContent = '익명 접속 완료';
         authBadge.title = `projectId: ${firebase.app().options.projectId}`;
         show(home);
+        startPresence();
+        setPresenceStatus('home');
+      } else {
+        stopPresence();
       }
       setDebug();
     });
@@ -195,6 +272,7 @@
     // ========== 큐(대기열) 기반 자동 매칭 ==========
     async function startMatching() {
       if (!currentUser) return;
+      setPresenceStatus('matching');
       hide(document.getElementById('idleActions'));
       show(matchingBox);
 
@@ -298,6 +376,7 @@
         waitingDocRef = null;
         hide(matchingBox);
         show(document.getElementById('idleActions'));
+        setPresenceStatus('home');
       }
     }
 
@@ -306,6 +385,7 @@
       if (!currentUser) return;
       hide(document.getElementById('idleActions'));
       show(matchingBox);
+      setPresenceStatus('matching');
 
       const nickH = pickNick();
       const roomDoc = await db.collection('rooms').add({
@@ -346,6 +426,7 @@
 
       hide(document.getElementById('idleActions'));
       show(matchingBox);
+      setPresenceStatus('matching');
 
       const ref = db.collection('rooms').doc(code);
       const RETRY_LIMIT = 1;
@@ -399,6 +480,7 @@
           const msg = byMessage[e.message] || byCode[e.code] || '입장에 실패했어요. 코드와 상태를 확인해 주세요.';
           show(document.getElementById('idleActions'));
           hide(matchingBox);
+          setPresenceStatus('home');
           alert(msg);
           return;
         }
@@ -428,6 +510,7 @@
 
       roomRef = db.collection('rooms').doc(currentRoomId);
       setDebug();
+      setPresenceStatus('room');
 
       // 보호: 같은 UID로 페어링된 방은 종료
       roomRef.get().then(s => {
@@ -521,6 +604,7 @@
         show(home); show(document.getElementById('idleActions'));
         messages.innerHTML = '';
         statusbar.textContent = '';
+        setPresenceStatus('home');
         setDebug();
       }
     }
@@ -566,7 +650,7 @@
       catch { alert('복사 실패! 코드를 직접 선택해 복사해 주세요.'); }
     });
 
-    // 탭 종료 시 대기표/방 정리
+    // 탭 종료 시 대기표/방 정리 + presence 정리
     window.addEventListener('beforeunload', () => {
       if (waitingDocRef) {
         waitingDocRef.update({ active:false }).catch(()=>{});
@@ -580,6 +664,7 @@
         }).catch(()=>{});
         ref.update({ [`connected.${roleKey()}`]: false, [`hb.${roleKey()}`]: 0, ended: true }).catch(()=>{});
       }
+      stopPresence();
     });
   </script>
 </body>
